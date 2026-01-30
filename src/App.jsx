@@ -1,15 +1,31 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { createClient } from '@supabase/supabase-js';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { 
   Home, LayoutDashboard, Ticket, Settings, Bell, Plus, CheckCircle2, Clock, X, Send, ChevronRight,
   Users, LogOut, UserPlus, Trash2, TrendingUp, Activity, Archive, AlertCircle, Lock, ArrowRight,
-  Check, MoreHorizontal, Filter, ListFilter, Loader2, Shield, CheckCheck
+  Check, MoreHorizontal, Filter, ListFilter, Loader2, Shield, CheckCheck, Search, Calendar,
+  BarChart3, RefreshCw, Edit3, Save
 } from 'lucide-react';
 
 // --- CONFIGURATION ---
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
+// Safe access for environment variables in different build environments
+const getEnv = (key) => {
+  if (typeof import.meta !== 'undefined' && import.meta.env) {
+    return import.meta.env[key] || '';
+  }
+  if (typeof process !== 'undefined' && process.env) {
+    return process.env[key] || '';
+  }
+  return '';
+};
+
+const supabaseUrl = getEnv('VITE_SUPABASE_URL');
+const supabaseKey = getEnv('VITE_SUPABASE_ANON_KEY');
+
+// Initialize client only if keys exist to prevent crash, else handle gracefully in UI
+const supabase = (supabaseUrl && supabaseKey) 
+  ? createClient(supabaseUrl, supabaseKey) 
+  : null;
 
 const LOGO_URL = "https://github.com/arko-studios/Nightcore-Studio-lite/blob/main/logo%20for%20nightcore.png?raw=true";
 
@@ -86,6 +102,28 @@ const StatsCard = ({ title, value, icon: Icon, color, subtext }) => (
   </div>
 );
 
+// A simple CSS-only Bar Chart for the Dashboard
+const SimpleBarChart = ({ data }) => {
+  const max = Math.max(...data.map(d => d.count), 1);
+  return (
+    <div className="flex items-end justify-between h-full gap-2 px-4 pb-2">
+      {data.map((item, i) => (
+        <div key={i} className="flex flex-col items-center gap-2 group w-full">
+          <div 
+            className="w-full bg-[#F347EE]/20 rounded-t-lg transition-all duration-500 group-hover:bg-[#F347EE] relative"
+            style={{ height: `${(item.count / max) * 100}%`, minHeight: '4px' }}
+          >
+             <div className="opacity-0 group-hover:opacity-100 absolute -top-8 left-1/2 -translate-x-1/2 bg-gray-900 text-white text-xs py-1 px-2 rounded-lg whitespace-nowrap z-10">
+               {item.count} Tickets
+             </div>
+          </div>
+          <span className="text-[10px] text-gray-400 font-medium rotate-0 truncate w-full text-center">{item.date}</span>
+        </div>
+      ))}
+    </div>
+  );
+};
+
 // --- MAIN APPLICATION ---
 
 export default function ProximaGoApp() {
@@ -108,9 +146,14 @@ export default function ProximaGoApp() {
   const [deleteConfirmationId, setDeleteConfirmationId] = useState(null);
   const [selectedTicket, setSelectedTicket] = useState(null);
 
-  // Filters
+  // Filters & Search
+  const [searchQuery, setSearchQuery] = useState('');
   const [filterCategory, setFilterCategory] = useState(null);
   const [filterStatus, setFilterStatus] = useState(null);
+  const [sortOrder, setSortOrder] = useState('newest'); // newest, oldest, priority
+
+  // Dashboard Date Range
+  const [dateRange, setDateRange] = useState('all'); // 'all', '7days', '30days'
   
   // Forms
   const [authForm, setAuthForm] = useState({ email: '', password: '' });
@@ -127,10 +170,19 @@ export default function ProximaGoApp() {
   
   const [newUserForm, setNewUserForm] = useState({ name: '', email: '', password: '', role: 'Helper' });
   const [newComment, setNewComment] = useState('');
+  
+  // Settings Form
+  const [settingsForm, setSettingsForm] = useState({ username: '', email_notifications: true });
+  const [isEditingProfile, setIsEditingProfile] = useState(false);
 
   // --- INITIALIZATION ---
 
   useEffect(() => {
+    if (!supabase) {
+      setLoading(false);
+      return;
+    }
+
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
       if (session) initData(session.user.id);
@@ -164,6 +216,7 @@ export default function ProximaGoApp() {
   }, []);
 
   const initData = async (userId) => {
+    if (!supabase) return;
     setLoading(true);
     await Promise.all([fetchProfile(userId), fetchTickets(), fetchNotifications(userId)]);
     setLoading(false);
@@ -171,7 +224,13 @@ export default function ProximaGoApp() {
 
   const fetchProfile = async (userId) => {
     const { data } = await supabase.from('profiles').select('*').eq('id', userId).single();
-    if (data) setProfile(data);
+    if (data) {
+      setProfile(data);
+      setSettingsForm({ 
+        username: data.username || '', 
+        email_notifications: data.email_notifications ?? true 
+      });
+    }
   };
 
   const fetchTickets = async () => {
@@ -180,7 +239,6 @@ export default function ProximaGoApp() {
   };
 
   const fetchNotifications = async (userId) => {
-    // Only fetch notifications for THIS user
     const { data } = await supabase.from('notifications')
       .select('*')
       .eq('user_id', userId)
@@ -190,20 +248,22 @@ export default function ProximaGoApp() {
   };
 
   // --- PERMISSIONS ---
-  // "Helpers should be able to edit tickets as well, but not create accounts"
   const isAdmin = profile?.role === 'Admin';
   const isStaff = ['Admin', 'Helper'].includes(profile?.role);
   
-  // Capabilities
   const canManageUsers = isAdmin; 
-  const canManageTickets = isStaff; // Edit status, Create tickets
-  const canDeleteTickets = isAdmin; // Usually safer to keep delete restricted to Admin
+  const canManageTickets = isStaff;
+  const canDeleteTickets = isAdmin;
 
   // --- HANDLERS ---
 
   // Auth
   const handleLogin = async (e) => {
     e.preventDefault();
+    if (!supabase) {
+      setAuthError("Supabase client not initialized. Missing environment variables.");
+      return;
+    }
     setAuthError('');
     setIsSubmitting(true);
     const { error } = await supabase.auth.signInWithPassword({
@@ -248,12 +308,27 @@ export default function ProximaGoApp() {
     }
   };
 
+  const handleUpdateProfile = async () => {
+    setIsSubmitting(true);
+    const { error } = await supabase.from('profiles').update({
+      username: settingsForm.username,
+      email_notifications: settingsForm.email_notifications
+    }).eq('id', session.user.id);
+
+    if (!error) {
+      setProfile({ ...profile, ...settingsForm });
+      setIsEditingProfile(false);
+    } else {
+      alert("Failed to update profile");
+    }
+    setIsSubmitting(false);
+  };
+
   // Tickets
   const handleCreateTicket = async (e) => {
     e.preventDefault();
     setIsSubmitting(true);
     
-    // 1. Create Ticket
     const { data, error } = await supabase.from('tickets').insert([{
       ...newTicket,
       created_by: session.user.id,
@@ -267,10 +342,8 @@ export default function ProximaGoApp() {
       setNewTicket({ title: '', type: 'Incident', category: 'Apps', priority: 'Medium', description: '' });
       setActiveTab('tickets');
 
-      // 2. BROADCAST NOTIFICATIONS
-      // Fetch ALL profiles to send notifications to everyone
+      // Notifications logic
       const { data: allProfiles } = await supabase.from('profiles').select('id');
-      
       if (allProfiles && allProfiles.length > 0) {
         const notificationsToInsert = allProfiles.map(user => ({
           user_id: user.id,
@@ -278,18 +351,9 @@ export default function ProximaGoApp() {
           text: `New Ticket: ${createdTicket.title}`,
           is_read: false
         }));
-
         await supabase.from('notifications').insert(notificationsToInsert);
-        
-        // Optimistically update current user's feed
-        const myNotif = notificationsToInsert.find(n => n.user_id === session.user.id);
-        if (myNotif) {
-             // We need the ID for keying, but optimistic updates usually lack ID.
-             // We'll just fetch fresh to be safe or mock it.
-             fetchNotifications(session.user.id);
-        }
+        fetchNotifications(session.user.id);
       }
-
     } else {
       alert(error?.message);
     }
@@ -338,13 +402,10 @@ export default function ProximaGoApp() {
   };
 
   const handleNotificationClick = async (notif) => {
-    // 1. Mark as read
     if (!notif.is_read) {
         await supabase.from('notifications').update({ is_read: true }).eq('id', notif.id);
         setNotifications(notifications.map(n => n.id === notif.id ? { ...n, is_read: true } : n));
     }
-
-    // 2. Navigate to ticket if linked
     if (notif.ticket_id) {
         const ticket = tickets.find(t => t.id === notif.ticket_id);
         if (ticket) {
@@ -363,8 +424,6 @@ export default function ProximaGoApp() {
 
   const handleClearAllNotifications = async () => {
     if (!session?.user?.id) return;
-    
-    // Update all unread notifications for THIS user to read
     const { error } = await supabase
       .from('notifications')
       .update({ is_read: true })
@@ -384,26 +443,85 @@ export default function ProximaGoApp() {
   };
 
   const unreadCount = notifications.filter(n => !n.is_read).length;
+  const getProfileInitials = () => (profile?.username || session?.user?.email || '?').charAt(0).toUpperCase();
 
-  const stats = useMemo(() => ({
-    total: tickets.length,
-    resolved: tickets.filter(t => ['Resolved', 'Closed'].includes(t.status)).length,
-    active: tickets.filter(t => ['Open', 'In Progress'].includes(t.status)).length,
-    upcoming: tickets.filter(t => ['Upcoming', 'Planned'].includes(t.status)).length
-  }), [tickets]);
+  // --- LOGIC: DASHBOARD STATS ---
+  const dashboardData = useMemo(() => {
+    let relevantTickets = tickets;
+    const now = new Date();
 
-  const filteredTickets = useMemo(() => {
-    return tickets.filter(t => {
-      const matchCat = filterCategory ? t.category === filterCategory : true;
-      const matchStatus = filterStatus ? t.status === filterStatus : true;
-      return matchCat && matchStatus;
+    if (dateRange !== 'all') {
+      const days = dateRange === '7days' ? 7 : 30;
+      const cutoff = new Date(now.setDate(now.getDate() - days));
+      relevantTickets = tickets.filter(t => new Date(t.created_at) >= cutoff);
+    }
+
+    // Daily Volume for Chart
+    const volumeMap = {};
+    relevantTickets.forEach(t => {
+      const dateKey = new Date(t.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      volumeMap[dateKey] = (volumeMap[dateKey] || 0) + 1;
     });
-  }, [tickets, filterCategory, filterStatus]);
 
-  const getProfileInitials = () => {
-    const name = profile?.username || session?.user?.email;
-    return name ? name.charAt(0).toUpperCase() : '?';
-  };
+    // Fill in last 7 days empty spots if 7days selected (for prettier graph)
+    if (dateRange === '7days') {
+        for (let i=6; i>=0; i--) {
+            const d = new Date();
+            d.setDate(d.getDate() - i);
+            const key = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+            if (!volumeMap[key]) volumeMap[key] = 0;
+        }
+    }
+
+    // Sort chart data by date
+    const chartData = Object.entries(volumeMap).map(([date, count]) => ({ date, count }));
+    // Simple sort trick for DD MMM format, relying on browser localized string stability for simple cases
+    // For robust sorting, we'd use timestamps, but this is a quick fix for visual
+    // Actually, since the map keys are strings, we rely on the insertion order or need to sort.
+    // Let's just reverse the ticket list order since it's typically new->old
+    const sortedChartData = chartData.reverse(); 
+
+    return {
+      total: relevantTickets.length,
+      resolved: relevantTickets.filter(t => ['Resolved', 'Closed'].includes(t.status)).length,
+      active: relevantTickets.filter(t => ['Open', 'In Progress'].includes(t.status)).length,
+      upcoming: relevantTickets.filter(t => ['Upcoming', 'Planned'].includes(t.status)).length,
+      chart: sortedChartData
+    };
+  }, [tickets, dateRange]);
+
+  // --- LOGIC: TICKET SEARCH & FILTER ---
+  const filteredTickets = useMemo(() => {
+    let result = tickets;
+
+    // 1. Text Search
+    if (searchQuery) {
+      const lowerQ = searchQuery.toLowerCase();
+      result = result.filter(t => 
+        t.title.toLowerCase().includes(lowerQ) || 
+        t.id.toString().includes(lowerQ) ||
+        (t.description && t.description.toLowerCase().includes(lowerQ))
+      );
+    }
+
+    // 2. Filters
+    if (filterCategory) result = result.filter(t => t.category === filterCategory);
+    if (filterStatus) result = result.filter(t => t.status === filterStatus);
+
+    // 3. Sort
+    result = [...result].sort((a, b) => {
+      if (sortOrder === 'newest') return new Date(b.created_at) - new Date(a.created_at);
+      if (sortOrder === 'oldest') return new Date(a.created_at) - new Date(b.created_at);
+      if (sortOrder === 'priority') {
+        const pMap = { 'Critical': 3, 'High': 2, 'Medium': 1, 'Low': 0 };
+        return pMap[b.priority] - pMap[a.priority];
+      }
+      return 0;
+    });
+
+    return result;
+  }, [tickets, filterCategory, filterStatus, searchQuery, sortOrder]);
+
 
   // --- RENDERERS ---
 
@@ -431,6 +549,13 @@ export default function ProximaGoApp() {
           </div>
 
           <form onSubmit={handleLogin} className="space-y-6">
+            {!supabase && (
+              <div className="bg-amber-50 text-amber-700 text-sm p-4 rounded-2xl flex items-center gap-2 mb-4 border border-amber-100">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>Supabase keys not found in this environment. Please clone locally to connect.</span>
+              </div>
+            )}
+
             {authError && (
               <div className="bg-red-50 text-red-600 text-sm p-4 rounded-2xl flex items-center gap-2 animate-in slide-in-from-top-2">
                 <AlertCircle className="w-4 h-4 shrink-0" />
@@ -468,8 +593,8 @@ export default function ProximaGoApp() {
 
             <button 
               type="submit" 
-              disabled={isSubmitting}
-              className={`w-full ${BTN_GRADIENT} text-white font-bold py-4 rounded-2xl shadow-lg shadow-pink-200 transition-transform active:scale-95 flex items-center justify-center gap-2`}
+              disabled={isSubmitting || !supabase}
+              className={`w-full ${BTN_GRADIENT} text-white font-bold py-4 rounded-2xl shadow-lg shadow-pink-200 transition-transform active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed`}
             >
                {isSubmitting ? <Loader2 className="animate-spin" /> : 'Sign In'} <ArrowRight className="w-5 h-5" />
             </button>
@@ -486,65 +611,122 @@ export default function ProximaGoApp() {
   // --- INTERNAL VIEWS ---
 
   const renderHome = () => (
-    <div className="animate-fade-in max-w-2xl mx-auto pt-20 text-center">
+    <div className="animate-fade-in max-w-4xl mx-auto pt-12 text-center">
       <div className="w-24 h-24 bg-white rounded-[2rem] mx-auto flex items-center justify-center shadow-2xl shadow-pink-100 mb-8 rotate-3 transition-transform hover:rotate-6 border border-gray-50">
         <Logo size="lg" />
       </div>
-      <h1 className="text-6xl font-black text-gray-900 mb-6 tracking-tight">
+      <h1 className="text-5xl md:text-6xl font-black text-gray-900 mb-6 tracking-tight">
         Proxima<span className={GRADIENT_TEXT}>Go</span>
       </h1>
       <p className="text-xl text-gray-500 mb-10 leading-relaxed max-w-lg mx-auto">
-        Let's get things moving. Streamlined ticket management platform for the Proxima services.
+        Welcome back, <span className="font-bold text-gray-900">{profile?.username}</span>. 
+        Your streamlined command center for ticket management.
       </p>
       
-      {canManageTickets ? (
+      <div className="flex justify-center gap-4 mb-12">
+        {canManageTickets ? (
+          <button 
+            onClick={() => setShowCreateModal(true)}
+            className={`bg-gray-900 hover:bg-black text-white text-lg font-bold px-10 py-4 rounded-2xl transition-all shadow-xl shadow-gray-200 active:scale-95 flex items-center gap-3`}
+          >
+            <Plus className="w-5 h-5" /> Start a Ticket
+          </button>
+        ) : (
+          <div className="bg-pink-50 text-pink-800 px-6 py-4 rounded-xl inline-flex items-center gap-2 border border-pink-100">
+            <AlertCircle className="w-5 h-5" />
+            <span>Read-Only Mode</span>
+          </div>
+        )}
         <button 
-          onClick={() => setShowCreateModal(true)}
-          className={`bg-gray-900 hover:bg-black text-white text-lg font-bold px-10 py-4 rounded-2xl transition-all shadow-xl shadow-gray-200 active:scale-95 flex items-center gap-3 mx-auto`}
-        >
-          <Plus className="w-5 h-5" /> Start a Ticket
+            onClick={() => setActiveTab('dashboard')}
+            className={`bg-white hover:bg-gray-50 text-gray-900 border border-gray-200 text-lg font-bold px-10 py-4 rounded-2xl transition-all shadow-sm active:scale-95 flex items-center gap-3`}
+          >
+            <Activity className="w-5 h-5" /> View Stats
         </button>
-      ) : (
-        <div className="bg-pink-50 text-pink-800 px-6 py-4 rounded-xl inline-flex items-center gap-2 border border-pink-100">
-          <AlertCircle className="w-5 h-5" />
-          <span>Read-Only Mode</span>
-        </div>
-      )}
+      </div>
+
+      {/* Quick Activity Glance */}
+      <div className="bg-white rounded-[2rem] p-8 text-left shadow-sm border border-gray-100 max-w-2xl mx-auto">
+        <h3 className="font-bold text-gray-900 mb-4 flex items-center gap-2">
+           <Clock className="w-4 h-4 text-[#F347EE]" /> Recent Activity
+        </h3>
+        {tickets.length > 0 ? (
+          <div className="space-y-3">
+             {tickets.slice(0, 3).map(t => (
+               <div key={t.id} onClick={() => { setSelectedTicket(t); setActiveTab('detail'); }} className="flex justify-between items-center p-3 hover:bg-gray-50 rounded-xl cursor-pointer group transition-colors">
+                  <div className="flex items-center gap-3">
+                     <div className={`w-2 h-2 rounded-full ${t.status === 'Open' ? 'bg-blue-500' : 'bg-gray-300'}`}></div>
+                     <span className="text-sm font-medium text-gray-700 group-hover:text-gray-900">{t.title}</span>
+                  </div>
+                  <span className="text-xs text-gray-400">{new Date(t.created_at).toLocaleDateString()}</span>
+               </div>
+             ))}
+          </div>
+        ) : (
+          <p className="text-gray-400 text-sm">No recent tickets.</p>
+        )}
+      </div>
     </div>
   );
 
   const renderDashboard = () => (
     <div className="animate-fade-in space-y-8">
-      <div>
-        <h2 className="text-2xl font-bold text-gray-900">Dashboard Overview</h2>
-        <p className="text-gray-500">Real-time metrics for {new Date().toLocaleDateString()}</p>
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div>
+          <h2 className="text-2xl font-bold text-gray-900">Dashboard Overview</h2>
+          <p className="text-gray-500">
+             Metrics for <span className="font-bold text-gray-800">{dateRange === 'all' ? 'All Time' : dateRange === '7days' ? 'Last 7 Days' : 'Last 30 Days'}</span>
+          </p>
+        </div>
+        
+        {/* Date Range Picker */}
+        <div className="bg-white p-1 rounded-xl border border-gray-200 inline-flex shadow-sm">
+           <button 
+             onClick={() => setDateRange('7days')} 
+             className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${dateRange === '7days' ? 'bg-gray-900 text-white shadow-md' : 'text-gray-500 hover:text-gray-900 hover:bg-gray-50'}`}
+           >
+             7 Days
+           </button>
+           <button 
+             onClick={() => setDateRange('30days')} 
+             className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${dateRange === '30days' ? 'bg-gray-900 text-white shadow-md' : 'text-gray-500 hover:text-gray-900 hover:bg-gray-50'}`}
+           >
+             30 Days
+           </button>
+           <button 
+             onClick={() => setDateRange('all')} 
+             className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${dateRange === 'all' ? 'bg-gray-900 text-white shadow-md' : 'text-gray-500 hover:text-gray-900 hover:bg-gray-50'}`}
+           >
+             All Time
+           </button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <StatsCard 
           title="Total Tickets" 
-          value={stats.total} 
+          value={dashboardData.total} 
           icon={Ticket} 
           color="bg-[#F347EE]" 
-          subtext="All time volume"
+          subtext="In selected period"
         />
         <StatsCard 
           title="Resolved" 
-          value={stats.resolved} 
+          value={dashboardData.resolved} 
           icon={CheckCircle2} 
           color="bg-emerald-500" 
-          subtext={`${stats.total > 0 ? ((stats.resolved / stats.total) * 100).toFixed(0) : 0}% completion rate`}
+          subtext={`${dashboardData.total > 0 ? ((dashboardData.resolved / dashboardData.total) * 100).toFixed(0) : 0}% completion rate`}
         />
         <StatsCard 
           title="Active Issues" 
-          value={stats.active} 
+          value={dashboardData.active} 
           icon={Activity} 
           color="bg-[#FCD34D]" 
           subtext="Requires attention"
         />
         <StatsCard 
           title="Upcoming" 
-          value={stats.upcoming} 
+          value={dashboardData.upcoming} 
           icon={TrendingUp} 
           color="bg-cyan-500" 
           subtext="Scheduled items"
@@ -552,9 +734,18 @@ export default function ProximaGoApp() {
       </div>
 
       <div className="bg-white rounded-[2rem] p-8 border border-gray-100 shadow-sm">
-        <h3 className="text-lg font-bold text-gray-900 mb-4">Quick Analysis</h3>
-        <div className="h-40 bg-gray-50 rounded-xl flex items-center justify-center border border-dashed border-gray-200 text-gray-400">
-          Analytics Graph Placeholder (Data Visualization)
+        <h3 className="text-lg font-bold text-gray-900 mb-6 flex items-center gap-2">
+            <BarChart3 className="w-5 h-5 text-gray-400" />
+            Ticket Volume Trend
+        </h3>
+        <div className="h-64 w-full">
+            {dashboardData.chart.length > 0 ? (
+               <SimpleBarChart data={dashboardData.chart} />
+            ) : (
+                <div className="h-full flex items-center justify-center text-gray-400 border border-dashed border-gray-200 rounded-xl">
+                    No data for this period
+                </div>
+            )}
         </div>
       </div>
     </div>
@@ -564,76 +755,116 @@ export default function ProximaGoApp() {
     <div className="bg-white rounded-[2rem] shadow-sm border border-gray-100 min-h-[600px] flex flex-col animate-fade-in">
       <div className="p-8 border-b border-gray-100 flex flex-col md:flex-row justify-between md:items-center gap-4">
         <div>
-          <h2 className="text-2xl font-bold text-gray-900">My Tickets</h2>
-          <p className="text-gray-500 text-sm mt-1">Track issues and feature requests</p>
+          <h2 className="text-2xl font-bold text-gray-900">Ticket Registry</h2>
+          <p className="text-gray-500 text-sm mt-1">{filteredTickets.length} tickets found</p>
         </div>
         
-        <div className="flex items-center gap-2 flex-wrap">
-          {/* Category Filter */}
-          <div className="relative">
-             <button 
-               onClick={(e) => toggleMenu(e, 'filter-category')}
-               className={`flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-medium border transition-colors menu-trigger ${filterCategory ? 'bg-blue-50 text-blue-600 border-blue-200' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'}`}
-             >
-               <Filter className="w-4 h-4" /> 
-               {filterCategory || 'Category'}
-             </button>
-             {activeMenu === 'filter-category' && (
-               <div className="absolute right-0 top-full mt-2 w-56 bg-white shadow-xl rounded-xl border border-gray-100 p-1 z-20 animate-in fade-in zoom-in-95 menu-container">
-                 {CATEGORIES.map(c => (
-                   <button 
-                     key={c}
-                     onClick={() => { setFilterCategory(c); setActiveMenu(null); }}
-                     className={`block w-full text-left px-3 py-2 text-sm rounded-lg flex items-center justify-between ${filterCategory === c ? 'bg-blue-50 text-blue-600 font-bold' : 'hover:bg-gray-50 text-gray-700'}`}
-                   >
-                     {c}
-                     {filterCategory === c && <Check className="w-3 h-3" />}
-                   </button>
-                 ))}
-               </div>
-             )}
+        <div className="flex flex-col md:flex-row md:items-center gap-3 w-full md:w-auto">
+          {/* SEARCH BAR */}
+          <div className="relative flex-1 md:w-64">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+            <input 
+                type="text" 
+                placeholder="Search ID, title..." 
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full bg-gray-50 border-gray-200 rounded-xl pl-9 pr-4 py-2 text-sm focus:ring-2 focus:ring-[#F347EE] outline-none transition-all"
+            />
+            {searchQuery && (
+                <button onClick={() => setSearchQuery('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-red-500">
+                    <X className="w-3 h-3" />
+                </button>
+            )}
           </div>
 
-          {/* Status Filter */}
-          <div className="relative">
-             <button 
-               onClick={(e) => toggleMenu(e, 'filter-status')}
-               className={`flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-medium border transition-colors menu-trigger ${filterStatus ? 'bg-blue-50 text-blue-600 border-blue-200' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'}`}
-             >
-               <ListFilter className="w-4 h-4" /> 
-               {filterStatus || 'Status'}
-             </button>
-             {activeMenu === 'filter-status' && (
-               <div className="absolute right-0 top-full mt-2 w-40 bg-white shadow-xl rounded-xl border border-gray-100 p-1 z-20 animate-in fade-in zoom-in-95 menu-container">
-                 {TICKET_STATUSES.map(s => (
-                   <button 
-                     key={s}
-                     onClick={() => { setFilterStatus(s); setActiveMenu(null); }}
-                     className={`block w-full text-left px-3 py-2 text-sm rounded-lg flex items-center justify-between ${filterStatus === s ? 'bg-blue-50 text-blue-600 font-bold' : 'hover:bg-gray-50 text-gray-700'}`}
-                   >
-                     {s}
-                     {filterStatus === s && <Check className="w-3 h-3" />}
-                   </button>
-                 ))}
-               </div>
+          <div className="flex items-center gap-2 flex-wrap">
+             {/* Category Filter */}
+             <div className="relative">
+                <button 
+                  onClick={(e) => toggleMenu(e, 'filter-category')}
+                  className={`flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-medium border transition-colors menu-trigger whitespace-nowrap ${filterCategory ? 'bg-blue-50 text-blue-600 border-blue-200' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'}`}
+                >
+                  <Filter className="w-4 h-4" /> 
+                  {filterCategory || 'Category'}
+                </button>
+                {activeMenu === 'filter-category' && (
+                  <div className="absolute right-0 top-full mt-2 w-56 bg-white shadow-xl rounded-xl border border-gray-100 p-1 z-20 animate-in fade-in zoom-in-95 menu-container">
+                    {CATEGORIES.map(c => (
+                      <button 
+                        key={c}
+                        onClick={() => { setFilterCategory(c); setActiveMenu(null); }}
+                        className={`block w-full text-left px-3 py-2 text-sm rounded-lg flex items-center justify-between ${filterCategory === c ? 'bg-blue-50 text-blue-600 font-bold' : 'hover:bg-gray-50 text-gray-700'}`}
+                      >
+                        {c}
+                        {filterCategory === c && <Check className="w-3 h-3" />}
+                      </button>
+                    ))}
+                  </div>
+                )}
+             </div>
+
+             {/* Status Filter */}
+             <div className="relative">
+                <button 
+                  onClick={(e) => toggleMenu(e, 'filter-status')}
+                  className={`flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-medium border transition-colors menu-trigger whitespace-nowrap ${filterStatus ? 'bg-blue-50 text-blue-600 border-blue-200' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'}`}
+                >
+                  <ListFilter className="w-4 h-4" /> 
+                  {filterStatus || 'Status'}
+                </button>
+                {activeMenu === 'filter-status' && (
+                  <div className="absolute right-0 top-full mt-2 w-40 bg-white shadow-xl rounded-xl border border-gray-100 p-1 z-20 animate-in fade-in zoom-in-95 menu-container">
+                    {TICKET_STATUSES.map(s => (
+                      <button 
+                        key={s}
+                        onClick={() => { setFilterStatus(s); setActiveMenu(null); }}
+                        className={`block w-full text-left px-3 py-2 text-sm rounded-lg flex items-center justify-between ${filterStatus === s ? 'bg-blue-50 text-blue-600 font-bold' : 'hover:bg-gray-50 text-gray-700'}`}
+                      >
+                        {s}
+                        {filterStatus === s && <Check className="w-3 h-3" />}
+                      </button>
+                    ))}
+                  </div>
+                )}
+             </div>
+
+             {/* Sort Order */}
+             <div className="relative">
+                <button 
+                  onClick={(e) => toggleMenu(e, 'sort')}
+                  className="flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-medium border bg-white text-gray-600 border-gray-200 hover:bg-gray-50 whitespace-nowrap menu-trigger"
+                >
+                  {sortOrder === 'newest' ? 'Newest' : sortOrder === 'oldest' ? 'Oldest' : 'Priority'}
+                </button>
+                {activeMenu === 'sort' && (
+                   <div className="absolute right-0 top-full mt-2 w-32 bg-white shadow-xl rounded-xl border border-gray-100 p-1 z-20 animate-in fade-in zoom-in-95 menu-container">
+                      {['newest', 'oldest', 'priority'].map(o => (
+                         <button 
+                            key={o}
+                            onClick={() => { setSortOrder(o); setActiveMenu(null); }}
+                            className={`block w-full text-left px-3 py-2 text-sm rounded-lg capitalize ${sortOrder === o ? 'bg-pink-50 text-pink-600 font-bold' : 'hover:bg-gray-50'}`}
+                         >
+                            {o}
+                         </button>
+                      ))}
+                   </div>
+                )}
+             </div>
+
+             {(filterCategory || filterStatus || searchQuery) && (
+               <button 
+                 onClick={() => { setFilterCategory(null); setFilterStatus(null); setSearchQuery(''); }}
+                 className="text-xs text-gray-400 hover:text-red-500 font-bold px-2 whitespace-nowrap"
+               >
+                 Clear
+               </button>
              )}
           </div>
-
-          {(filterCategory || filterStatus) && (
-            <button 
-              onClick={() => { setFilterCategory(null); setFilterStatus(null); }}
-              className="text-xs text-gray-400 hover:text-red-500 font-bold px-2"
-            >
-              Clear
-            </button>
-          )}
-
-          <div className="h-8 w-px bg-gray-200 mx-1 hidden md:block"></div>
 
           {canManageTickets && (
             <button 
               onClick={() => setShowCreateModal(true)}
-              className={`flex items-center gap-2 text-white ${BTN_GRADIENT} px-4 py-2 rounded-xl font-bold text-sm transition-all shadow-md shadow-pink-100`}
+              className={`flex items-center gap-2 text-white ${BTN_GRADIENT} px-4 py-2 rounded-xl font-bold text-sm transition-all shadow-md shadow-pink-100 whitespace-nowrap`}
             >
               <Plus className="w-4 h-4" /> New Ticket
             </button>
@@ -643,9 +874,9 @@ export default function ProximaGoApp() {
 
       <div className="flex-1 overflow-auto">
         {filteredTickets.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full text-gray-400">
+          <div className="flex flex-col items-center justify-center h-full text-gray-400 py-12">
             <CheckCircle2 className="w-16 h-16 mb-4 opacity-20" />
-            <p>No tickets found matching your filters.</p>
+            <p>No tickets found matching your criteria.</p>
           </div>
         ) : (
           <div className="divide-y divide-gray-50">
@@ -830,27 +1061,73 @@ export default function ProximaGoApp() {
     <div className="animate-fade-in space-y-6 max-w-2xl">
       <h2 className="text-2xl font-bold text-gray-900">Settings</h2>
       
+      {/* Profile Settings */}
       <div className="bg-white rounded-[2rem] p-8 border border-gray-100 shadow-sm">
-        <h3 className="text-lg font-bold mb-6">General Preferences</h3>
+        <div className="flex items-center justify-between mb-6">
+          <h3 className="text-lg font-bold">My Profile</h3>
+          <button 
+            onClick={() => {
+              if (isEditingProfile) handleUpdateProfile();
+              else setIsEditingProfile(true);
+            }}
+            className="text-xs bg-gray-900 text-white px-3 py-1.5 rounded-lg font-bold flex items-center gap-1 hover:bg-black transition-colors"
+          >
+            {isEditingProfile ? <><Save className="w-3 h-3" /> Save Changes</> : <><Edit3 className="w-3 h-3" /> Edit Profile</>}
+          </button>
+        </div>
+
+        <div className="space-y-4">
+           <div>
+             <label className="text-sm font-bold text-gray-700 ml-1 mb-1 block">Display Name</label>
+             {isEditingProfile ? (
+               <input 
+                 type="text" 
+                 value={settingsForm.username} 
+                 onChange={(e) => setSettingsForm({...settingsForm, username: e.target.value})}
+                 className="w-full bg-gray-50 border-gray-200 rounded-xl px-4 py-2 text-sm focus:ring-2 focus:ring-[#F347EE] outline-none"
+               />
+             ) : (
+               <div className="text-gray-900 font-medium px-4 py-2 bg-gray-50 rounded-xl border border-transparent">{profile?.username || 'Not set'}</div>
+             )}
+           </div>
+        </div>
+      </div>
+
+      {/* Preferences */}
+      <div className="bg-white rounded-[2rem] p-8 border border-gray-100 shadow-sm">
+        <h3 className="text-lg font-bold mb-6">Preferences</h3>
         <div className="space-y-6">
           <div className="flex items-center justify-between">
             <div>
               <div className="font-medium text-gray-900">Email Notifications</div>
-              <div className="text-sm text-gray-500">Receive daily summaries</div>
+              <div className="text-sm text-gray-500">Receive daily summaries and updates</div>
             </div>
-            <div className={`w-12 h-6 ${GRADIENT_BG} rounded-full relative cursor-pointer`}>
-              <div className="absolute right-1 top-1 w-4 h-4 bg-white rounded-full"></div>
-            </div>
+            <button 
+              onClick={() => {
+                const newVal = !settingsForm.email_notifications;
+                setSettingsForm({...settingsForm, email_notifications: newVal});
+                // Auto-save this preference immediately for better UX
+                if (!isEditingProfile) {
+                    supabase.from('profiles').update({ email_notifications: newVal }).eq('id', session.user.id);
+                }
+              }}
+              className={`w-12 h-6 rounded-full relative cursor-pointer transition-colors ${settingsForm.email_notifications ? GRADIENT_BG : 'bg-gray-200'}`}
+            >
+              <div className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-all ${settingsForm.email_notifications ? 'right-1' : 'left-1'}`}></div>
+            </button>
           </div>
         </div>
       </div>
 
-      <div className="bg-white rounded-[2rem] p-8 border border-gray-100 shadow-sm">
+      {/* Danger Zone */}
+      <div className="bg-white rounded-[2rem] p-8 border border-gray-100 shadow-sm opacity-60 hover:opacity-100 transition-opacity">
         <h3 className="text-lg font-bold mb-6 text-red-600">Danger Zone</h3>
-        <button className="text-red-600 border border-red-200 bg-red-50 px-6 py-3 rounded-xl font-medium text-sm hover:bg-red-100 w-full text-left flex items-center justify-between">
-           Archive all resolved tickets
-           <Archive className="w-4 h-4" />
-        </button>
+        <div className="flex items-center justify-between">
+            <span className="text-sm text-gray-500">Archiving tickets removes them from active views but keeps them in the database.</span>
+            <button className="text-red-600 border border-red-200 bg-red-50 px-4 py-2 rounded-xl font-medium text-xs hover:bg-red-100 flex items-center gap-2">
+            <Archive className="w-3 h-3" /> Archive Resolved
+            </button>
+        </div>
       </div>
     </div>
   );
@@ -868,7 +1145,7 @@ export default function ProximaGoApp() {
         <div className="flex-1 space-y-2 px-4">
           <SidebarItem icon={Home} label="Home" active={activeTab === 'home'} onClick={() => setActiveTab('home')} />
           <SidebarItem icon={LayoutDashboard} label="Dashboard" active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} />
-          <SidebarItem icon={Ticket} label="My Tickets" active={activeTab === 'tickets' || activeTab === 'detail'} onClick={() => setActiveTab('tickets')} />
+          <SidebarItem icon={Ticket} label="Ticket Registry" active={activeTab === 'tickets' || activeTab === 'detail'} onClick={() => setActiveTab('tickets')} />
           <SidebarItem icon={Settings} label="Settings" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} />
         </div>
 
